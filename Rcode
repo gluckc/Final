@@ -1,1 +1,208 @@
-code
+---
+title: "Characterizing the Epigenome in Chronic Kidney Disease"
+author: "Caroline Gluck"
+output: html_document
+---
+
+### Overview
+The goal of this project is to characterize the epigenome in chronic kidney disease using disease relevant tissue (microdissected human kidney tissue). I analyzed DNA methylation data from the laboratory of Dr. Katalin Susztak (raw data files and codebook available via external harddrive). DNA methylation was measured using the Infinium HumanMethylation450 BeadChip array. The dataset includes kidney samples from patients with chronic kidney disease and controls.
+Faculty/staff: 
+Katalin Susztak (Nephrology)- PI. Provided dataset. Actively involved in analysis process (I discuss pipeline and sample selection as well as variables in analysis with her). 
+Blanca Himes (bioninformatics)- discussed GEO as source for reference methylation data (however, I have decided to use a reference free method for now) 
+Deanne Taylor (bioinformatics) - helped me to start navigating RnBeads and troubleshooted raw idat files (the problem was discrepancy in capitalization of file names)
+Cheng Xiang Qiu (Susztak Lab)- A bioinformatics specialist in my lab helped with normalization comparisons and helped me to troubleshoot pipeline issues (including data cleanup and cell type heterogeneity issues).
+Casey Greene (Bioinformatics)- helped me to think about controlling for cell type heterogeneity and introduced me to Maria Chikana (author of cellCODE) and Devin Koestler who suggested using the refernce free method on my data.
+
+Include a link to your final project GitHub repository.
+
+### Introduction
+Chronic kidney disease (CKD) is associated with significant morbidity and mortality. Approximately 11% of adults in the United States and Europe are affected by CKD. CKD risk cannot be fully explained by known CKD risk factors, such as hypertension and diabetes. The heritability of CKD is 36-75%, which supports a genetic component of CKD. However, GWAS identified SNP’s only explain a limited proportion of CKD heritability. Epigenetic changes may account for the “missing heritability” in CKD.
+
+The dataset includes kidney samples from patients with chronic kidney disease and controls. Kidney samples were microdissected and tubular DNA was isolate. DNA methylation was measured using the Infinium HumanMethylation450 BeadChip array. Methylation data was processed using a pipeline which accounts for probe filtering, background correction, adjustment for type II bias and batch effect as well as crossreactive probes using minfi and RnBeads in R. Data was normalized using SWAN before determining differentially methylated positions (DMPs).
+
+Epigenetics are cell type specific. Therefore, it is important to control for cell type heterogeneity. To address this, kidney samples were microdissected to only tubular compartement prior to methylation analysis. However, we expect patients with CKD to have increased fibrosis in comparison with controls – therefore even within the tubular compartment, they may have increased fibroblast percent composition. Therefore, I applied a cell type heterogeneity software to our data. Due to the difficulty in isolating specific epigenetic reference data,  I used a reference free softward RefFreeEWAS (developed by Houseman et al) which returns corrected pvalues.
+
+### Methods and Results
+As stated above, I used packages in R (specifically minfi and RnBeads) to analyze differentially methylated positions. In addition I used RefFreeEwas to account for cell type heterogeneity and determine corrected pvalues.
+
+```{r eval=TRUE}
+library("minfi")
+library("RnBeads")
+library("limma")
+library(marmalaid)
+library(IlluminaHumanMethylation450kmanifest)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(dplyr)
+library(ggplot2)
+library(gridExtra)
+library(tableone)
+library(RefFreeEWAS)
+```
+
+First we need to read in the idat files (methylation data) and annotation file which are located in our base directory. We next create our datasets to use in Minfi.
+
+```{r eval=TRUE}
+baseDir <- "/Users/gluckc/Desktop/minfiAECM"
+list.files(baseDir)
+targets <- read.450k.sheet(baseDir) #Phenotype file with information specific to the 450K experiment 
+targets
+sub(baseDir, "", targets$Basename)
+RGset <- read.450k.exp(targets = targets)
+head(RGset)
+pd <- pData(RGset)
+pd[,1:20]
+```
+
+Next, we want to create some quality control reports to ensure that appropriate bisulfite conversion occured.
+
+```{r eval=TRUE}
+qcReport(RGset, sampNames = pd$Sample_Name, sampGroups = pd$Sample_Group, pdf = "qcReport.pdf")
+densityPlot(RGset, sampGroups = pd$Sample_Group, main = "Beta", xlab = "Beta")
+par(oma=c(2,10,1,1))
+densityBeanPlot(RGset, sampGroups = pd$Sample_Group, sampNames = pd$Sample_Name)
+controlStripPlot(RGset, controls="BISULFITE CONVERSION II", sampNames = pd$Sample_Name)
+```
+
+Next we want to do "preprocessing" of our data based on the Minfi program
+
+```{r eval=TRUE}
+MSet<- preprocessRaw(RGset)
+```
+
+Next we would like to do Data Cleanup. First we should remove probes with poor quality (p>0.01)
+
+```{r eval=TRUE}
+detP<- detectionP(RGset, type = "m+u")
+success<- apply(detP<1e-2,1,all)
+Mset.detp <- MSet[success]
+```
+
+Next we need to remove cross reactive probes (that hybridize to multiple locations on the genome). The crossreactive table was provided by Chen YA et al. "Discovery of cross-reactive probes and polymorphic CpGs in the Illumina Infinium HumanMethylation450 microarray" Epigenomics 8, 203-209 (2013)
+
+```{r eval=TRUE}
+crossactive<- read.table(file.path(baseDir,"crossactive.txt"),header=TRUE)$TargetID
+Mset.detp.cross <- Mset.detp[!getAnnotation(Mset.detp)$Name %in% crossactive,]
+```
+
+
+Next we need to remove probes that cross react with the sex chromasomes
+
+```{r eval=TRUE}
+Mset.detp.cross.sex <- Mset.detp.cross[(getAnnotation(Mset.detp.cross)$chr!="chrX")&(getAnnotation(Mset.detp.cross)$chr!="chrY"),]
+```
+
+Finally, common SNPs from dbSNP137 (minor allele frequency > 1%) within each 450k probe or identified to be at the single base extension site (position 0), or at the proximal CpG on the probe (positions 1–2) or within the probe body (positions 3–50) were identified and those probes were removed.
+
+```{r eval=TRUE}
+Mset.detp.cross.sex.snp <- Mset.detp.cross.sex[(is.na(getAnnotation(Mset.detp.cross.sex)$CpG_maf)|getAnnotation(Mset.detp.cross.sex)$CpG_maf<0.01)&(is.na(getAnnotation(Mset.detp.cross.sex)$SBE_maf)|getAnnotation(Mset.detp.cross.sex)$SBE_maf<0.01),]
+```
+
+Now we are ready to normalize the data using SWAN. Multiple normalizaiton methods were tested separately on our data -- both SWAN and BMIQ performed well for data normalization. Methylated site, unmethylated sites were determined as well as Beta values (which have a value of 0 to 1) and log transformed beta values (M values).
+
+```{r eval=TRUE}
+Mset.swan <- preprocessSWAN(RGset, Mset.detp.cross.sex.snp)
+Meth<- getMeth(Mset.swan)
+Unmethy<- getUnmeth(Mset.swan)
+Beta<- getBeta(Mset.swan, type="Illumina")
+Mvalue<- getM(Mset.swan)
+mset<- Mset.swan
+```
+
+
+
+Now on to find our differentially methylated positions. I want to find differential methylation based on CKD status (CKD = CKD stages3-5, no CKD = CKD stages 0-2). 
+
+Lets start by looking at the MDS of the data.
+```{r eval=TRUE}
+mdsPlot(Mset.swan, numPositions = 1000, sampGroups = pd$CKD, sampNames = pd$hk)
+```
+
+Next, lets find our DMPS.The code for dmpFinder requires a M values. I used a qCutoff of 1.
+
+```{r eval=TRUE}
+M <- getM(mset, type="beta")
+dmp<- dmpFinder(M, pheno=pd$CKD, type="categorical", qCutoff=1, shrinkVar = FALSE)
+head(dmp)
+```
+
+For any given probe we can visualize the difference between groups with the following code. Since this output is very large, lets only look at the first 2 positions.
+
+```{r eval=TRUE}
+cpgs <- rownames(dmp)[1:2]
+par(mfrow=c(2,2))
+plotCpg(Mset.swan, cpg=cpgs, pheno=pd$CKD)
+```
+
+Next I used beta values with the Marmalaid package to make a heatmap of top 200 differentially methylated loci (again using CKD status to divide the data).
+
+```{r eval=TRUE}
+status=as.character(pd$CKD)
+dmps=dmpFinder(Beta,status,"categorical") 
+head(cbind(M[row.names(dmps),],dmps))
+heatmap(Beta[row.names(dmps[1:200,]),],labCol=status)
+CKD.colors <- unlist(lapply(pd$CKD, function(x){if (x=="1") "red" else "blue"}))
+heatmap(Beta[row.names(dmps[1:200,]),],labCol=status, col=topo.colors(100), ColSideColors=CKD.colors)
+```
+
+What if we label the diabetes instead?
+```{r eval=TRUE}
+DM.colors<- unlist(lapply(pd$DM, function(x){if (x=="1") "yellow" else "green"}))
+heatmap(Beta[row.names(dmps[1:200,]),],labCol=status, col=topo.colors(100), ColSideColors=DM.colors)
+```
+
+This heatmap looks very similar and is likely related to diabetes counfounding our data as described below. First we need to make our data into factors so that we can more easily describe it.
+
+```{r eval=TRUE}
+str(targets)
+targets.clean<- targets
+targets.clean$Gender<- factor(targets$Gender, levels= c("1","0"), labels= c("Female", "Male"))
+targets.clean$CKD<- factor(targets$CKD, levels= c("1","0"), labels= c("CKD", "NoCKD"))
+targets.clean$DM<- factor(targets$DM, levels= c("1","0"), labels= c("DM", "NoDM"))
+targets.clean$HTN<- factor(targets$HTN, levels= c("1","0"), labels= c("HTN", "NoHTN"))
+str(targets.clean)
+```
+
+I'd like to start by simply creating a "table 1" for the data. I found a package in R called "tableone" which makes a table 1. 
+
+```{r eval=TRUE}
+vars <- c("Gender","Age","DM","HTN")
+tableOne <- CreateTableOne(vars = vars, strata = c("CKD"), data = targets.clean)
+tableOne
+print(tableOne)
+```
+
+Table 1 is good, but I'd like a nicer way to visualize just how confounded the data is by diabetes and hypertension. I think these boxplots demostrate the data well. It is not surprizing that hypertension counfounds CKD status. In addition, for this limited dataset diabetes is a counfounder.
+
+```{r eval=TRUE}
+ggplot(data=targets.clean, aes(x=targets.clean$CKD,fill=targets.clean$Gender))+geom_bar()
+ggplot(data=targets.clean, aes(x=targets.clean$CKD,fill=targets.clean$DM))+geom_bar()
+ggplot(data=targets.clean, aes(x=targets.clean$CKD,fill=targets.clean$HTN))+geom_bar()
+by_CKD <- group_by(targets.clean, CKD)
+```
+
+Finally, lets see if we can control for cell type heterogeneity using the RefFreeEwas package. However, this package is tricky to use. Therefore, we will use the version of RefFreeEwas that is accessible through RnBeads.
+
+We need to load a covariates table with the phenotype of interest. We also need a beta matrix.
+
+```{r eval=TRUE}
+covariable<- read.table("/Users/gluckc/Desktop/minfiAECM/covariates/covariates2.txt",header=TRUE)
+head(covariable)
+betamatrix.nonnormalized<-getBeta(Mset.detp.cross.sex.snp, type="Illumina")
+head(betamatrix.nonnormalized)
+```
+
+The following code was successful. However, when I tried to use the covariate table (other than phenotype of interest) I got an error message that occurs with perfect correlation. This may be due to the high confounding of our covariables.Knowing that DM and HTN almost perfectly correlates, I tried to remove these from the covariates, however I got the same error message.
+
+```{r eval=TRUE}
+str(covariable)
+NewBeta2<- refFreeEWASP(betamatrix.nonnormalized, which(covariable$CKD==1), which(covariable$noCKD==1), adjustment.table = NULL,
+             paired = FALSE, nboot = 100, ignore.na = TRUE,
+             rescale.residual = TRUE)
+head(NewBeta2)
+write.table(NewBeta2,paste(baseDir,"/","NewBeta",sep=""),row.names = FALSE)
+```
+
+The output is adjusted p values. The estimated number of latent components is 13 base one the output.
+
+### Conclusion
+Overall, there appears to be differences in methylation between patients with chronic kidney disease and controls. It is difficult to assess for contributions of cell type heterogeneity in a meaningful way (the output of 13 latent components may not all be cell type heterogeneity but may be related to other confounders as well). We will need to find a way to validate these adjustments before drawing meaningful conclusions from the differentially methyalated loci. Future directions of this project will focus on validated the results. One way to validate these results may be to go back to the idea of using reference epigenomes (although this is problematic as well). We can also use gene expression data to validate cell type proportions by applying Maria Chikana's CellCode. 
